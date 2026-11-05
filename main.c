@@ -7,12 +7,16 @@
 
 #define PARKING_BAY_COUNT 5
 #define VEHICLE_QUEUE_LENGTH 10
+
 #define MONITOR_INTERVAL_MS 2000
 #define ALLOCATION_INTERVAL_MS 100
+#define RELEASE_INTERVAL_MS 250
+#define PARKING_DURATION_MS 8000
 
 typedef struct {
     int bay_id;
     int vehicle_id;
+    TickType_t occupied_since;
 } ParkingBay;
 
 typedef struct {
@@ -20,13 +24,12 @@ typedef struct {
     BaseType_t is_vip;
 } Vehicle;
 
-/* A vehicle ID of 0 means the bay is available. */
 static ParkingBay parking_bays[PARKING_BAY_COUNT] = {
-    { 1, 0 },
-    { 2, 0 },
-    { 3, 0 },
-    { 4, 0 },
-    { 5, 0 }
+    { 1, 0, 0 },
+    { 2, 0, 0 },
+    { 3, 0, 0 },
+    { 4, 0, 0 },
+    { 5, 0, 0 }
 };
 
 static SemaphoreHandle_t parking_mutex;
@@ -103,10 +106,6 @@ static void vehicle_arrival_task(void *argument)
             ? vip_queue
             : normal_queue;
 
-        /*
-         * Arrivals and allocations use the same mutex.
-         * This protects the VIP selection and allocation decision.
-         */
         xSemaphoreTake(parking_mutex, portMAX_DELAY);
 
         if (xQueueSend(selected_queue, &vehicle, 0) == pdPASS) {
@@ -117,13 +116,11 @@ static void vehicle_arrival_task(void *argument)
 
         xSemaphoreGive(parking_mutex);
 
-        /* The second group arrives three seconds later. */
         if (i == 2) {
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 
-    /* All six simulated arrivals have been generated. */
     for (;;) {
         vTaskSuspend(NULL);
     }
@@ -144,7 +141,6 @@ static void bay_allocation_task(void *argument)
                 continue;
             }
 
-            /* Waiting VIPs always receive the next available bay. */
             received = xQueueReceive(vip_queue, &vehicle, 0);
 
             if (received != pdPASS) {
@@ -156,6 +152,7 @@ static void bay_allocation_task(void *argument)
             }
 
             parking_bays[i].vehicle_id = vehicle.vehicle_id;
+            parking_bays[i].occupied_since = xTaskGetTickCount();
 
             print_vehicle_event(
                 "ASSIGNMENT",
@@ -167,6 +164,62 @@ static void bay_allocation_task(void *argument)
         xSemaphoreGive(parking_mutex);
 
         vTaskDelay(pdMS_TO_TICKS(ALLOCATION_INTERVAL_MS));
+    }
+}
+
+static void bay_release_task(void *argument)
+{
+    (void)argument;
+
+    for (;;) {
+        xSemaphoreTake(parking_mutex, portMAX_DELAY);
+
+        TickType_t current_time = xTaskGetTickCount();
+
+        for (int i = 0; i < PARKING_BAY_COUNT; i++) {
+            Vehicle departing_vehicle;
+            TickType_t elapsed_time;
+
+            if (parking_bays[i].vehicle_id == 0) {
+                continue;
+            }
+
+            elapsed_time = (TickType_t)(
+                current_time - parking_bays[i].occupied_since
+            );
+
+            /*
+             * Simulate an exit after eight seconds of parking.
+             * A real system would receive an exit sensor event.
+             */
+            if (elapsed_time >= pdMS_TO_TICKS(PARKING_DURATION_MS)) {
+                departing_vehicle.vehicle_id =
+                    parking_bays[i].vehicle_id;
+
+                departing_vehicle.is_vip = is_registered_vip(
+                    departing_vehicle.vehicle_id
+                );
+
+                print_vehicle_event(
+                    "EXIT",
+                    &departing_vehicle,
+                    parking_bays[i].bay_id
+                );
+
+                parking_bays[i].vehicle_id = 0;
+                parking_bays[i].occupied_since = 0;
+
+                print_vehicle_event(
+                    "RELEASE",
+                    &departing_vehicle,
+                    parking_bays[i].bay_id
+                );
+            }
+        }
+
+        xSemaphoreGive(parking_mutex);
+
+        vTaskDelay(pdMS_TO_TICKS(RELEASE_INTERVAL_MS));
     }
 }
 
@@ -219,12 +272,14 @@ static void parking_monitor_task(void *argument)
         for (int i = 0; i < PARKING_BAY_COUNT; i++) {
             if (snapshot[i].vehicle_id == 0) {
                 printf(
-                    "Bay=%d | Vehicle=N/A | Status=AVAILABLE\n",
+                    "[%lu ms] Bay=%d | Vehicle=N/A | Status=AVAILABLE\n",
+                    timestamp_ms,
                     snapshot[i].bay_id
                 );
             } else {
                 printf(
-                    "Bay=%d | Vehicle=%d | Status=OCCUPIED\n",
+                    "[%lu ms] Bay=%d | Vehicle=%d | Status=OCCUPIED\n",
+                    timestamp_ms,
                     snapshot[i].bay_id,
                     snapshot[i].vehicle_id
                 );
@@ -235,6 +290,22 @@ static void parking_monitor_task(void *argument)
 
         vTaskDelay(pdMS_TO_TICKS(MONITOR_INTERVAL_MS));
     }
+}
+
+static BaseType_t create_parking_task(
+    TaskFunction_t function,
+    const char *name,
+    UBaseType_t priority
+)
+{
+    return xTaskCreate(
+        function,
+        name,
+        configMINIMAL_STACK_SIZE * 2,
+        NULL,
+        priority,
+        NULL
+    );
 }
 
 int main(void)
@@ -258,33 +329,25 @@ int main(void)
         return 1;
     }
 
-    /*
-     * Arrivals have the highest application priority so each
-     * simulated group is queued before allocation begins.
-     */
-    if (xTaskCreate(
+    if (create_parking_task(
             vehicle_arrival_task,
             "VehicleArrival",
-            configMINIMAL_STACK_SIZE * 2,
-            NULL,
-            tskIDLE_PRIORITY + 3,
-            NULL
+            tskIDLE_PRIORITY + 3
         ) != pdPASS ||
-        xTaskCreate(
+        create_parking_task(
             bay_allocation_task,
             "BayAllocation",
-            configMINIMAL_STACK_SIZE * 2,
-            NULL,
-            tskIDLE_PRIORITY + 2,
-            NULL
+            tskIDLE_PRIORITY + 2
         ) != pdPASS ||
-        xTaskCreate(
+        create_parking_task(
+            bay_release_task,
+            "BayRelease",
+            tskIDLE_PRIORITY + 2
+        ) != pdPASS ||
+        create_parking_task(
             parking_monitor_task,
             "ParkingMonitor",
-            configMINIMAL_STACK_SIZE * 2,
-            NULL,
-            tskIDLE_PRIORITY + 1,
-            NULL
+            tskIDLE_PRIORITY + 1
         ) != pdPASS) {
         fputs("Could not create parking tasks.\n", stderr);
         return 1;
@@ -292,6 +355,7 @@ int main(void)
 
     puts("Autonomous Campus Parking Management System");
     puts("Registered VIP vehicles: 102 and 105");
+    puts("Simulated parking duration: 8 seconds");
 
     vTaskStartScheduler();
 
