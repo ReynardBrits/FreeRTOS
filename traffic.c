@@ -3,9 +3,9 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-#define GREEN_DURATION_MS 5000
+#define GREEN_DURATION_MS 10000
 #define YELLOW_DURATION_MS 2000
-#define RED_DURATION_MS 7000
+#define RED_DURATION_MS 12000
 
 static void display_ns_state(const char *state)
 {
@@ -49,7 +49,7 @@ int main(void)
     }
 
     puts("Question 3.1: North-South Traffic Light Timing");
-    puts("Green: 5 seconds | Yellow: 2 seconds | Red: 7 seconds\n");
+    puts("Green: 10 seconds | Yellow: 2 seconds | Red: 12 seconds\n");
 
     vTaskStartScheduler();
 
