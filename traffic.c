@@ -2,9 +2,11 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
 
 #define GREEN_DURATION_MS 10000
 #define YELLOW_DURATION_MS 2000
+#define LOG_QUEUE_LENGTH 16
 
 typedef enum {
     LIGHT_RED,
@@ -17,10 +19,17 @@ typedef struct {
     LightState east_west;
 } TrafficState;
 
+typedef struct {
+    TickType_t timestamp;
+    TrafficState state;
+} TrafficLogEvent;
+
 static TrafficState traffic_state = {
     LIGHT_RED,
     LIGHT_RED
 };
+
+static QueueHandle_t log_queue;
 
 static const char *light_name(LightState light)
 {
@@ -39,12 +48,25 @@ static const char *light_name(LightState light)
     }
 }
 
-static void set_lights(
+static unsigned long long ticks_to_ms(TickType_t ticks)
+{
+    return (
+        (unsigned long long)ticks * 1000ULL
+    ) / configTICK_RATE_HZ;
+}
+
+static TickType_t set_lights(
     LightState north_south,
     LightState east_west
 )
 {
-    /* At least one direction must always be red. */
+    static BaseType_t first_transition = pdTRUE;
+    static TickType_t start_tick;
+
+    TrafficLogEvent event;
+    TickType_t transition_tick;
+    BaseType_t result;
+
     configASSERT(
         north_south == LIGHT_RED || east_west == LIGHT_RED
     );
@@ -54,13 +76,51 @@ static void set_lights(
     traffic_state.north_south = north_south;
     traffic_state.east_west = east_west;
 
-    printf(
-        "[TRAFFIC] NS %s EW %s\n",
-        light_name(traffic_state.north_south),
-        light_name(traffic_state.east_west)
+    transition_tick = xTaskGetTickCount();
+
+    /* Start the timestamp clock at the first transition. */
+    if (first_transition == pdTRUE) {
+        start_tick = transition_tick;
+        first_transition = pdFALSE;
+    }
+
+    event.timestamp = (TickType_t)(
+        transition_tick - start_tick
     );
 
+    event.state = traffic_state;
+
     taskEXIT_CRITICAL();
+
+    /*
+     * Queue a copy of the transition.
+     * Waiting for space prevents silently dropping log events.
+     * Blocking queue operations are outside the critical section.
+     */
+    result = xQueueSend(log_queue, &event, portMAX_DELAY);
+
+    configASSERT(result == pdPASS);
+    (void)result;
+
+    return transition_tick;
+}
+
+static void hold_phase(
+    LightState north_south,
+    LightState east_west,
+    unsigned long duration_ms
+)
+{
+    TickType_t phase_start = set_lights(
+        north_south,
+        east_west
+    );
+
+    /* Measure the duration from the actual state change. */
+    xTaskDelayUntil(
+        &phase_start,
+        pdMS_TO_TICKS(duration_ms)
+    );
 }
 
 static void traffic_controller_task(void *argument)
@@ -68,42 +128,106 @@ static void traffic_controller_task(void *argument)
     (void)argument;
 
     for (;;) {
-        /* North-South green; East-West red. */
-        set_lights(LIGHT_GREEN, LIGHT_RED);
-        vTaskDelay(pdMS_TO_TICKS(GREEN_DURATION_MS));
+        hold_phase(
+            LIGHT_GREEN,
+            LIGHT_RED,
+            GREEN_DURATION_MS
+        );
 
-        /* North-South yellow; East-West remains red. */
-        set_lights(LIGHT_YELLOW, LIGHT_RED);
-        vTaskDelay(pdMS_TO_TICKS(YELLOW_DURATION_MS));
+        hold_phase(
+            LIGHT_YELLOW,
+            LIGHT_RED,
+            YELLOW_DURATION_MS
+        );
 
-        /* North-South red; East-West green. */
-        set_lights(LIGHT_RED, LIGHT_GREEN);
-        vTaskDelay(pdMS_TO_TICKS(GREEN_DURATION_MS));
+        hold_phase(
+            LIGHT_RED,
+            LIGHT_GREEN,
+            GREEN_DURATION_MS
+        );
 
-        /* North-South remains red; East-West yellow. */
-        set_lights(LIGHT_RED, LIGHT_YELLOW);
-        vTaskDelay(pdMS_TO_TICKS(YELLOW_DURATION_MS));
+        hold_phase(
+            LIGHT_RED,
+            LIGHT_YELLOW,
+            YELLOW_DURATION_MS
+        );
     }
+}
+
+static void logging_task(void *argument)
+{
+    TrafficLogEvent event;
+
+    (void)argument;
+
+    for (;;) {
+        if (xQueueReceive(
+                log_queue,
+                &event,
+                portMAX_DELAY
+            ) != pdPASS) {
+            continue;
+        }
+
+        unsigned long long timestamp_ms =
+            ticks_to_ms(event.timestamp);
+
+        taskENTER_CRITICAL();
+
+        printf(
+            "[LOG] %llums NS %s EW %s\n",
+            timestamp_ms,
+            light_name(event.state.north_south),
+            light_name(event.state.east_west)
+        );
+
+        taskEXIT_CRITICAL();
+    }
+}
+
+static BaseType_t create_traffic_task(
+    TaskFunction_t function,
+    const char *name,
+    UBaseType_t priority
+)
+{
+    return xTaskCreate(
+        function,
+        name,
+        configMINIMAL_STACK_SIZE * 2,
+        NULL,
+        priority,
+        NULL
+    );
 }
 
 int main(void)
 {
-    BaseType_t result = xTaskCreate(
-        traffic_controller_task,
-        "TrafficControl",
-        configMINIMAL_STACK_SIZE * 2,
-        NULL,
-        tskIDLE_PRIORITY + 1,
-        NULL
+    log_queue = xQueueCreate(
+        LOG_QUEUE_LENGTH,
+        sizeof(TrafficLogEvent)
     );
 
-    if (result != pdPASS) {
-        fputs("Could not create the traffic controller task.\n", stderr);
+    if (log_queue == NULL) {
+        fputs("Could not create the logging queue.\n", stderr);
         return 1;
     }
 
-    puts("Question 3.2: Synchronised Traffic Lights");
-    puts("Green: 10 seconds | Yellow: 2 seconds\n");
+    if (create_traffic_task(
+            logging_task,
+            "TrafficLogger",
+            tskIDLE_PRIORITY + 3
+        ) != pdPASS ||
+        create_traffic_task(
+            traffic_controller_task,
+            "TrafficControl",
+            tskIDLE_PRIORITY + 2
+        ) != pdPASS) {
+        fputs("Could not create traffic tasks.\n", stderr);
+        return 1;
+    }
+
+    puts("Question 3.3: Timestamped Traffic Light Logging\n");
 
     vTaskStartScheduler();
 
