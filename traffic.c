@@ -6,6 +6,7 @@
 
 #define GREEN_DURATION_MS 10000
 #define YELLOW_DURATION_MS 2000
+#define DISPLAY_INTERVAL_MS 1000
 #define LOG_QUEUE_LENGTH 16
 
 typedef enum {
@@ -55,6 +56,20 @@ static unsigned long long ticks_to_ms(TickType_t ticks)
     ) / configTICK_RATE_HZ;
 }
 
+static TrafficState get_traffic_snapshot(void)
+{
+    TrafficState snapshot;
+
+    /* Read both directions together without a partial update. */
+    taskENTER_CRITICAL();
+
+    snapshot = traffic_state;
+
+    taskEXIT_CRITICAL();
+
+    return snapshot;
+}
+
 static TickType_t set_lights(
     LightState north_south,
     LightState east_west
@@ -67,6 +82,7 @@ static TickType_t set_lights(
     TickType_t transition_tick;
     BaseType_t result;
 
+    /* At least one direction must remain red. */
     configASSERT(
         north_south == LIGHT_RED || east_west == LIGHT_RED
     );
@@ -78,7 +94,6 @@ static TickType_t set_lights(
 
     transition_tick = xTaskGetTickCount();
 
-    /* Start the timestamp clock at the first transition. */
     if (first_transition == pdTRUE) {
         start_tick = transition_tick;
         first_transition = pdFALSE;
@@ -92,11 +107,7 @@ static TickType_t set_lights(
 
     taskEXIT_CRITICAL();
 
-    /*
-     * Queue a copy of the transition.
-     * Waiting for space prevents silently dropping log events.
-     * Blocking queue operations are outside the critical section.
-     */
+    /* Send a copy of the transition to the logging task. */
     result = xQueueSend(log_queue, &event, portMAX_DELAY);
 
     configASSERT(result == pdPASS);
@@ -116,7 +127,6 @@ static void hold_phase(
         east_west
     );
 
-    /* Measure the duration from the actual state change. */
     xTaskDelayUntil(
         &phase_start,
         pdMS_TO_TICKS(duration_ms)
@@ -185,6 +195,32 @@ static void logging_task(void *argument)
     }
 }
 
+static void display_task(void *argument)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    (void)argument;
+
+    for (;;) {
+        TrafficState snapshot = get_traffic_snapshot();
+
+        taskENTER_CRITICAL();
+
+        printf(
+            "[TRAFFIC] NS %s EW %s\n",
+            light_name(snapshot.north_south),
+            light_name(snapshot.east_west)
+        );
+
+        taskEXIT_CRITICAL();
+
+        xTaskDelayUntil(
+            &last_wake_time,
+            pdMS_TO_TICKS(DISPLAY_INTERVAL_MS)
+        );
+    }
+}
+
 static BaseType_t create_traffic_task(
     TaskFunction_t function,
     const char *name,
@@ -222,12 +258,19 @@ int main(void)
             traffic_controller_task,
             "TrafficControl",
             tskIDLE_PRIORITY + 2
+        ) != pdPASS ||
+        create_traffic_task(
+            display_task,
+            "TrafficDisplay",
+            tskIDLE_PRIORITY + 1
         ) != pdPASS) {
         fputs("Could not create traffic tasks.\n", stderr);
         return 1;
     }
 
-    puts("Question 3.3: Timestamped Traffic Light Logging\n");
+    puts("Smart Intersection Traffic Signal Controller");
+    puts("Green: 10 seconds | Yellow: 2 seconds");
+    puts("Current status displayed every second.\n");
 
     vTaskStartScheduler();
 
