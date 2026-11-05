@@ -14,3 +14,6 @@ add_subdirectory(third_party/FreeRTOS-Kernel)
 
 add_executable(parking parking.c)
 target_link_libraries(parking PRIVATE freertos_kernel)
+
+add_executable(sensors sensors.c)
+target_link_libraries(sensors PRIVATE freertos_kernel)
